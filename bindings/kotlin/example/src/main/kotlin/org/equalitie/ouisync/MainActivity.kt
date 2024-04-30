@@ -1,11 +1,16 @@
 package org.equalitie.ouisync.example
 
+import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
+import android.os.Environment
 import android.util.Log
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -23,6 +28,7 @@ import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.BottomAppBar
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
@@ -74,15 +80,15 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-class AppViewModel(private val configDir: String, private val storeDir: String) : ViewModel() {
+class AppViewModel(private val configDir: String) : ViewModel() {
     class Factory(private val context: Context) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T {
             val rootDir = context.getFilesDir()
             val configDir = "$rootDir/config"
-            val storeDir = "$rootDir/store"
+            //val storeDir = "$rootDir/store"
 
-            return AppViewModel(configDir, storeDir) as T
+            return AppViewModel(configDir) as T
         }
     }
 
@@ -94,6 +100,8 @@ class AppViewModel(private val configDir: String, private val storeDir: String) 
 
     var repositories by mutableStateOf<Map<String, Repository>>(mapOf())
         private set
+
+    var storeDir by mutableStateOf<String?>(null)
 
     private var session: Session? = null
 
@@ -113,10 +121,10 @@ class AppViewModel(private val configDir: String, private val storeDir: String) 
             session?.let {
                 protocolVersion = it.currentProtocolVersion()
             }
-
-            openRepositories()
+            //openRepositories()
         }
     }
+
 
     suspend fun createRepository(name: String, token: String) {
         val session = this.session ?: return
@@ -144,6 +152,25 @@ class AppViewModel(private val configDir: String, private val storeDir: String) 
 
         repositories = repositories + (name to repo)
     }
+
+    suspend fun openRepository(name: String, token: String) {
+        val session = this.session ?: return
+
+        if (repositories.containsKey(name)) {
+            Log.e(TAG, "repository named \"$name\" already exists")
+            return
+        }
+
+        val repo = Repository.open(
+            session,
+            "$storeDir/$name.$DB_EXTENSION",
+        )
+
+        repo.setSyncEnabled(true)
+
+        repositories = repositories + (name to repo)
+    }
+
 
     suspend fun deleteRepository(name: String) {
         val repo = repositories.get(name) ?: return
@@ -200,12 +227,33 @@ class AppViewModel(private val configDir: String, private val storeDir: String) 
     }
 }
 
+fun checkUriPersisted(contentResolver: ContentResolver, uri: Uri): Boolean {
+    return contentResolver.persistedUriPermissions.any { perm -> perm.uri == uri }
+}
+
+class PermissibleOpenDocumentTreeContract(
+    private val write: Boolean = false,
+) : ActivityResultContracts.OpenDocumentTree() {
+    override fun createIntent(context: Context, input: Uri?): Intent {
+        val intent = super.createIntent(context, input)
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        if (write) {
+            intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+        }
+        intent.addFlags(Intent.FLAG_GRANT_PREFIX_URI_PERMISSION)
+        intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+
+        return intent
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun App(viewModel: AppViewModel) {
     val scope = rememberCoroutineScope()
     val snackbar = remember { Snackbar(scope) }
     var adding by remember { mutableStateOf(false) }
+    var importing by remember { mutableStateOf(false) }
 
     MaterialTheme {
         Scaffold(
@@ -233,13 +281,27 @@ fun App(viewModel: AppViewModel) {
                         Text(it)
                     }
 
+                    Button(onClick = { importing = true}
+                    ) {
+                        Text(text = "Import Existing Repo")
+                    }
+
                     RepositoryList(viewModel, snackbar = snackbar)
 
                     if (adding) {
-                        CreateRepositoryDialog(
+                        OpenDirectoryDialog(
                             viewModel,
+                            isImport = false,
                             snackbar = snackbar,
                             onDone = { adding = false },
+                        )
+                    }
+                    if (importing) {
+                        OpenDirectoryDialog(
+                            viewModel,
+                            isImport = true,
+                            snackbar = snackbar,
+                            onDone = { importing = false },
                         )
                     }
                 }
@@ -365,6 +427,75 @@ fun RepositoryItem(
 }
 
 @Composable
+fun OpenDirectoryDialog(
+    viewModel: AppViewModel,
+    isImport: Boolean,
+    onDone: () -> Unit,
+    snackbar: Snackbar,
+) {
+    val context = LocalContext.current
+    val isDirectoryPicked = remember { mutableStateOf(false) }
+    val dirPickerLauncher = rememberLauncherForActivityResult(
+        contract = PermissibleOpenDocumentTreeContract(true),
+        onResult = { maybeUri ->
+            maybeUri?.let { uri ->
+                val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                        Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                if (checkUriPersisted(context.contentResolver, uri)) {
+                    context.contentResolver.releasePersistableUriPermission(uri, flags)
+                }
+                context.contentResolver.takePersistableUriPermission(uri, flags)
+                uri.path?.let { path ->
+                    val split: List<String> = path.split(":".toRegex())
+                    val file = File(Environment.getExternalStorageDirectory(), split[1])
+                    viewModel.storeDir = file.path
+                    isDirectoryPicked.value = true
+                }
+            }
+        }
+    )
+
+    AlertDialog(
+        title = { Text("Open Directory Picker") },
+        confirmButton = {
+            TextButton(
+                onClick = { dirPickerLauncher.launch(Uri.EMPTY) },
+            ) {
+                Text("Continue")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = { onDone() }) {
+                Text("Cancel")
+            }
+        },
+        onDismissRequest = { onDone() },
+    )
+    if (isDirectoryPicked.value) {
+        if (isImport) {
+            ImportRepositoryDialog(
+                viewModel,
+                snackbar = snackbar,
+                onDone = {
+                    isDirectoryPicked.value = false
+                    onDone()
+                         },
+            )
+        }
+        else {
+            CreateRepositoryDialog(
+                viewModel,
+                snackbar = snackbar,
+                onDone = {
+                    isDirectoryPicked.value = false
+                    onDone()
+                         },
+            )
+        }
+    }
+}
+
+@Composable
 fun CreateRepositoryDialog(
     viewModel: AppViewModel,
     onDone: () -> Unit,
@@ -429,6 +560,7 @@ fun CreateRepositoryDialog(
         onDismissRequest = { onDone() },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(PADDING)) {
+                Text("Saving in ${viewModel.storeDir}")
                 TextField(
                     value = name,
                     onValueChange = { name = it },
@@ -450,6 +582,95 @@ fun CreateRepositoryDialog(
         },
     )
 }
+
+@Composable
+fun ImportRepositoryDialog(
+    viewModel: AppViewModel,
+    onDone: () -> Unit,
+    snackbar: Snackbar,
+) {
+    var scope = rememberCoroutineScope()
+
+    var name by remember {
+        mutableStateOf("")
+    }
+
+    var nameError by remember {
+        mutableStateOf("")
+    }
+
+    var token by remember {
+        mutableStateOf("")
+    }
+
+    fun validate(): Boolean {
+        if (name.isEmpty()) {
+            nameError = "Name is missing"
+            return false
+        }
+
+        if (viewModel.repositories.containsKey(name)) {
+            nameError = "Name is already taken"
+            return false
+        }
+
+        nameError = ""
+        return true
+    }
+
+    AlertDialog(
+        title = { Text("Open repository") },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    if (validate()) {
+                        scope.launch {
+                            try {
+                                viewModel.openRepository(name, token)
+                                snackbar.show("Repository imported")
+                            } catch (e: Exception) {
+                                snackbar.show("Repository import failed ($e)")
+                            } finally {
+                                onDone()
+                            }
+                        }
+                    }
+                },
+            ) {
+                Text("Import")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = { onDone() }) {
+                Text("Cancel")
+            }
+        },
+        onDismissRequest = { onDone() },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(PADDING)) {
+                Text("Importing from ${viewModel.storeDir}")
+                TextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("Name*") },
+                    supportingText = {
+                        if (!nameError.isEmpty()) {
+                            Text(nameError)
+                        }
+                    },
+                    isError = !nameError.isEmpty(),
+                )
+
+                TextField(
+                    label = { Text("Token") },
+                    value = token,
+                    onValueChange = { token = it },
+                )
+            }
+        },
+    )
+}
+
 
 class Snackbar(val scope: CoroutineScope) {
     val state = SnackbarHostState()
